@@ -1,5 +1,5 @@
 /*
- * jQuery File Upload Plugin 5.42.0
+ * jQuery File Upload Plugin 9.8.0+nginx-progress
  * https://github.com/blueimp/jQuery-File-Upload
  *
  * Copyright 2010, Sebastian Tschan
@@ -131,6 +131,9 @@
             // The parameter name for the redirect url, sent as part of the form
             // data and set to 'redirect' if this option is empty:
             redirectParamName: undefined,
+            // The URL to the nginx upload progress module that will return
+            // progress information for iframe transport requests.
+            progressURL: undefined,
             // Set the following option to the location of a postMessage window,
             // to enable postMessage transport uploads:
             postMessage: undefined,
@@ -509,6 +512,18 @@
             var targetHost = $('<a></a>').prop('href', options.url).prop('host');
             // Setting the dataType to iframe enables the iframe transport:
             options.dataType = 'iframe ' + (options.dataType || '');
+            if (options.progressURL) {
+                // Add a random base58 progress id to the URL for progress events
+                var addParamChar = /\?/.test(options.url) ? '&' : '?';
+                var randomString = function(length, chars) {
+                    var chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+                    var result = '';
+                    for (var i = length; i > 0; --i) result += chars[Math.round(Math.random() * (chars.length - 1))];
+                    return result;
+                }
+                options.progressID = randomString(16);
+                options.url += addParamChar + 'X-Progress-ID=' + options.progressID;
+            }
             // The iframe transport accepts a serialized array as form data:
             options.formData = this._getFormData(options);
             // Add redirect url to form data on cross-domain uploads:
@@ -811,6 +826,120 @@
             return promise;
         },
 
+        _iframeProgress: function(options) {
+            if (!options.progressID) {
+                return false;
+            }
+
+            var mainXHR = $.ajax(options);
+
+            var that = this;
+            // A function to fetch the progress. This is unset to stop the
+            // recursive chain of progress events.
+            var getProgress = null;
+            // A fake filesize in case we don't get any responses
+            // before the file has completed uploading.
+            var size = 100;
+
+            // Timing so we don't flood the progress handler
+            var lastStart = 0;
+            var lastEnd = 0;
+            var lastRun = 0;
+
+            // Track how many times we've tried asking for progress but not
+            // gotten it. We set a reasonable limit to prevent JS errors from
+            // causing an infinite number of AJAX requests.
+            var notFoundAttempts = 0;
+
+            // Determine how many milliseconds to wait before sending the next
+            // AJAX progress request based on how long the last one took
+            var calculateTimeout = function() {
+                lastRun = lastEnd - lastStart;
+                if (lastRun >= 150) {
+                    return 1;
+                }
+                return 150 - lastRun;
+            }
+
+            getProgress = function() {
+                // Since JSONP requests can't be cancelled, we
+                // don't track the resulting jqXHR object here.
+                $.ajax({
+                    url: options.progressURL,
+                    dataType: 'jsonp',
+                    type: 'GET',
+                    data: {'X-Progress-ID': options.progressID},
+                    success: function (data, textStatus, jqXHR) {
+                        lastEnd = new Date().getTime();
+
+                        // If the progress function has been nullified, the
+                        // request has completed in one way or another
+                        if (!getProgress) {
+                            return;
+                        }
+                        if (data.state === 'done') {
+                            return;
+                        }
+
+                        // Figure out the real size from the progress handler
+                        // since browsers using an iframe can't get it before
+                        // the request is sent.
+                        if (data.size && size != data.size) {
+                            size = data.size;
+                            if (options.total < data.size) {
+                                options._progress.total = options.total = data.size;
+                            }
+                        }
+
+                        that._onProgress($.Event('progress', {
+                            lengthComputable: true,
+                            loaded: data.received,
+                            total: data.size
+                        }), options);
+
+                        if (data.size == data.received) {
+                            return;
+                        }
+                        if (getProgress) {
+                            setTimeout(getProgress, calculateTimeout());
+                        }
+                    },
+                    error: function(jqXHR, textStatus, errorThrown) {
+                        lastEnd = new Date().getTime();
+                        // If the result is a 404, that means the progress ID
+                        // has not been registered yet, so we want to try again.
+                        // Any other errors are real errors and we should quit.
+                        if (errorThrown != 'Not Found') {
+                            return;
+                        }
+                        // Attempt the progress handler up to 60 times before
+                        // giving up. 60 * the 150ms timeout should result in
+                        // trying for around 10 seconds.
+                        notFoundAttempts += 1;
+                        if (getProgress && notFoundAttempts <= 60) {
+                            setTimeout(getProgress, calculateTimeout());
+                        }
+                    }
+                });
+                lastStart = new Date().getTime();
+            }
+
+            getProgress();
+
+            mainXHR.done(function() {
+                getProgress = null;
+                that._onProgress($.Event('progress', {
+                    lengthComputable: true,
+                    loaded: size,
+                    total: size
+                }), options);
+            }).fail(function() {
+                getProgress = null;
+            });
+
+            return mainXHR;
+        },
+
         _beforeSend: function (e, data) {
             if (this._active === 0) {
                 // the start callback is triggered when an upload starts
@@ -896,6 +1025,7 @@
                             options
                         ) === false) &&
                         that._getXHRPromise(false, options.context, aborted)) ||
+                        that._iframeProgress(options) ||
                         that._chunkedUpload(options) || $.ajax(options)
                     ).done(function (result, textStatus, jqXHR) {
                         that._onDone(result, textStatus, jqXHR, options);
